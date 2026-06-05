@@ -394,7 +394,6 @@ int main(int argc, char *argv[]) {
   }
 
   double *log_N_over_f = new double[nhist];
-  double *denom_log = new double[N_total];
 
   // DIIS parameters and buffers
   const int diis_m = 5;
@@ -410,18 +409,6 @@ int main(int argc, char *argv[]) {
       log_N_over_f[jfile] = log(nentry[jfile] / oldweight[jfile]);
     }
 
-// 2. Compute denominator log-sum-exp for each data point
-#pragma omp parallel for
-    for (int d = 0; d < N_total; ++d) {
-      double ylog = -1e9;
-      for (int jfile = 0; jfile < nhist; ++jfile) {
-        double tmp1 = A[d * nhist + jfile] + log_N_over_f[jfile];
-        ylog = std::max(ylog, tmp1) + log(1.0 + exp(-fabs(ylog - tmp1)));
-      }
-      denom_log[d] = ylog;
-    }
-
-    // 3. Accumulate weights for each kfile
     std::vector<double> current_weight(nhist, 0.0);
 
     int nthreads = 1;
@@ -450,8 +437,13 @@ int main(int argc, char *argv[]) {
 
 #pragma omp for schedule(static)
       for (int d = 0; d < N_total; ++d) {
+        double ylog = -1e9;
+        for (int jfile = 0; jfile < nhist; ++jfile) {
+          double tmp1 = A[d * nhist + jfile] + log_N_over_f[jfile];
+          ylog = std::max(ylog, tmp1) + log(1.0 + exp(-fabs(ylog - tmp1)));
+        }
         for (int kfile = 0; kfile < nhist; ++kfile) {
-          local_weights[kfile] += exp(A[d * nhist + kfile] - denom_log[d]);
+          local_weights[kfile] += exp(A[d * nhist + kfile] - ylog);
         }
       }
 
@@ -579,7 +571,6 @@ int main(int argc, char *argv[]) {
 
   delete[] A;
   delete[] log_N_over_f;
-  delete[] denom_log;
 
   return 0;
 }
