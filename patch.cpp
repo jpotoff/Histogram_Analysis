@@ -149,21 +149,18 @@ int main(int argc, char *argv[]) {
   }
 
   int *maxp_overall = new int[ncompin];
+  for (int j = 0; j < ncompin; ++j) {
+    maxp_overall[j] = -1e5;
+  }
   vector<string> histname;
   double xbox;
   double ybox;
   double zbox;
-  // vector<vector<int> > n[ncompin];
-  vector<vector<int>> n[2];
-  vector<vector<int>> n1;
-  vector<vector<int>> n2;
+  vector<vector<vector<int>>> n(ncompin);
   vector<vector<double>> e;
-  vector<int> n1t;
-  vector<int> n2t;
+  vector<vector<int>> nt_temp(ncompin);
   vector<double> et;
   vector<int> nentry;
-  int ntemp1;
-  int ntemp2;
   double etemp;
   double crap;
   string s;
@@ -187,11 +184,15 @@ int main(int argc, char *argv[]) {
     fin2 >> nhist_old;
     fin2 >> suffix;
     for (int i = 0; i < nhist_old; ++i) {
-      fin2 >> histid[i] >> temp >> oldweight[i] >> t[i] >> mu[i][0] >> mu[i][1];
+      fin2 >> histid[i] >> temp >> oldweight[i] >> t[i];
       cout << setw(4) << histid[i] << std::scientific << setprecision(6)
            << setw(14) << oldweight[i] << std::fixed << setprecision(2)
-           << setw(8) << t[i] << setw(10) << mu[i][0] << setw(10) << mu[i][1]
-           << endl;
+           << setw(8) << t[i];
+      for (int c = 0; c < ncompin; ++c) {
+        fin2 >> mu[i][c];
+        cout << setw(10) << mu[i][c];
+      }
+      cout << endl;
     }
     fin2.clear();
     fin2.close();
@@ -214,10 +215,14 @@ int main(int argc, char *argv[]) {
   cout << "Reading " << nhist << " histograms" << endl;
   cout << endl;
   // cout << setfill('=')<<setw(80) << "=" <<setfill(' ')<<endl;
-  cout << setw(8) << "Histogram" << setw(8) << "Nentry" << setw(8) << "Temp"
-       << setw(10) << "mu1" << setw(10) << "mu2" << setw(8) << "n1-min"
-       << setw(8) << "n1-max" << setw(8) << "n2-min" << setw(8) << "n2-max"
-       << endl;
+  cout << setw(8) << "Histogram" << setw(8) << "Nentry" << setw(8) << "Temp";
+  for (int c = 0; c < ncompin; ++c) {
+    cout << setw(8) << "mu" << c + 1;
+  }
+  for (int c = 0; c < ncompin; ++c) {
+    cout << setw(8) << "n" << c + 1 << "-min" << setw(8) << "n" << c + 1 << "-max";
+  }
+  cout << endl;
   cout << setfill('=') << setw(80) << "=" << setfill(' ') << endl;
   cout << std::fixed;
   for (int i = 0; i < nhist; ++i) {
@@ -235,14 +240,11 @@ int main(int argc, char *argv[]) {
       exit(1);
     }
     // read header information
-    if (ncompin == 2) {
-      fin >> t[i] >> ncomp[i] >> mu[i][0] >> mu[i][1] >> lx[i] >> ly[i] >>
-          lz[i];
-      // mu[i][0] used because C++ is backwards of fortran.  C++ = row-major
-      // order
-    } else if (ncompin == 1) {
-      fin >> t[i] >> ncomp[i] >> mu[0][i] >> lx[i] >> ly[i] >> lz[i];
+    fin >> t[i] >> ncomp[i];
+    for (int c = 0; c < ncompin; ++c) {
+      fin >> mu[i][c];
     }
+    fin >> lx[i] >> ly[i] >> lz[i];
 
     beta[i] = 1.0 / t[i]; // Computing the reciprocal value for the temp
 
@@ -269,62 +271,44 @@ int main(int argc, char *argv[]) {
       }
     }
     int j = 0;
-    while (fin) {
-      if (ncompin == 2) {
-        fin >> ntemp1 >> ntemp2 >> etemp;
-
-        minp[i][0] = std::min(minp[i][0], ntemp1);
-        minp[i][1] = std::min(minp[i][1], ntemp2);
-        maxp[i][0] = std::max(maxp[i][0], ntemp1);
-        maxp[i][1] = std::max(maxp[i][1], ntemp2);
-
-        // Doesn't have to be in the loop. We can calc the max at the end
-        maxp_overall[0] = std::max(maxp[i][0], maxp_overall[0]);
-        maxp_overall[1] = std::max(maxp[i][1], maxp_overall[1]);
-
-        n1t.push_back(ntemp1);
-        n2t.push_back(ntemp2);
-        et.push_back(etemp);
-
-      } else {
-        minp[i][0] = std::min(minp[i][0], ntemp1);
-        maxp[i][0] = std::max(maxp[i][0], ntemp1);
-        n1t.push_back(ntemp1);
-        et.push_back(etemp);
-        cerr << "haven't coded this yet" << endl;
+    vector<int> ntemp(ncompin);
+    while (true) {
+      for (int c = 0; c < ncompin; ++c) {
+        fin >> ntemp[c];
       }
+      fin >> etemp;
+      if (fin.eof() || fin.fail()) break;
+
+      for (int c = 0; c < ncompin; ++c) {
+        minp[i][c] = std::min(minp[i][c], ntemp[c]);
+        maxp[i][c] = std::max(maxp[i][c], ntemp[c]);
+        maxp_overall[c] = std::max(maxp[i][c], maxp_overall[c]);
+        nt_temp[c].push_back(ntemp[c]);
+      }
+      et.push_back(etemp);
       ++j;
     }
     // move data from temporary variables into vectors.  First index is
     // component,
     //  second index is file name, third is the data label
-    if (ncompin == 1) {
-      n[0].push_back(n1t);
-      e.push_back(et);
-      nentry.push_back(n[0][i].size() - 1);
-      cout << setprecision(2) << setw(8) << histname[i] << setw(8) << nentry[i]
-           << setw(8) << t[i] << setw(10) << mu[i][0] << setw(8) << minp[i][0]
-           << setw(8) << maxp[i][0] << setw(8) << endl;
-      // clear temporary arrays, otherwise "bad things" happen
-      n1t.clear();
-      n2t.clear();
-      et.clear();
-    } else if (ncompin == 2) {
-      n[0].push_back(n1t);
-      n[1].push_back(n2t);
-      e.push_back(et);
-      nentry.push_back(n[0][i].size() - 1);
-      // cout << "New Value: " << n[0][i].size()-1 << endl;
-      cout << setprecision(2) << setw(8) << histname[i] << setw(8) << nentry[i]
-           << setw(8) << t[i] << setw(10) << mu[i][0] << setw(10) << mu[i][1]
-           << setw(8) << minp[i][0] << setw(8) << maxp[i][0] << setw(8)
-           << minp[i][1] << setw(8) << maxp[i][1] << endl;
-      // clear temporary arrays, otherwise "bad things" happen
-      n1t.clear();
-      n2t.clear();
-      et.clear();
+    for (int c = 0; c < ncompin; ++c) {
+      n[c].push_back(nt_temp[c]);
+      nt_temp[c].clear();
     }
-    // cout << "number of entries = " << nentry[i] <<endl;
+    e.push_back(et);
+    nentry.push_back(n[0][i].size());
+    cout << setprecision(2) << setw(8) << histname[i] << setw(8) << nentry[i]
+         << setw(8) << t[i];
+    for (int c = 0; c < ncompin; ++c) {
+      cout << setw(10) << mu[i][c];
+    }
+    for (int c = 0; c < ncompin; ++c) {
+      cout << setw(8) << minp[i][c] << setw(8) << maxp[i][c];
+    }
+    cout << endl;
+
+    // clear temporary arrays, otherwise "bad things" happen
+    et.clear();
 
     fin.clear();
     fin.close();
@@ -565,8 +549,11 @@ int main(int argc, char *argv[]) {
       for (int ifile = 0; ifile < nhist; ++ifile) {
         fout << setw(4) << histid[ifile] << setw(10) << nentry[ifile]
              << setw(20) << std::scientific << setprecision(8) << weight[ifile]
-             << setw(10) << std::fixed << setprecision(2) << t[ifile]
-             << setw(10) << mu[ifile][0] << setw(10) << mu[ifile][1] << endl;
+             << setw(10) << std::fixed << setprecision(2) << t[ifile];
+        for (int c = 0; c < ncompin; ++c) {
+          fout << setw(10) << mu[ifile][c];
+        }
+        fout << endl;
       }
       fout << "Total iterations = " << iter << endl;
       fout << "Convergence = " << setprecision(10) << maxd << endl;
