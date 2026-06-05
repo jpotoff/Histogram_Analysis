@@ -341,29 +341,21 @@ int main(int argc, char *argv[]) {
     N_total += nentry[i];
   }
 
-  // Flatten the raw data to map contiguous indices (d)
-  std::vector<double> flat_E(N_total);
-  std::vector<std::vector<int>> flat_N(ncompin, std::vector<int>(N_total));
-  
+  // Precalculate A_j(data) = -beta_j * E + sum_c (beta_j * mu_{j,c} * N_c)
+  // This replaces the enormous 'prob' array that caused massive over-allocation
+  double *A = new double[N_total * nhist];
   int data_idx = 0;
   for (int ifile = 0; ifile < nhist; ++ifile) {
     for (int i = 0; i < nentry[ifile]; ++i) {
-      flat_E[data_idx] = e[ifile][i];
-      for (int icomp = 0; icomp < ncompin; ++icomp) {
-        flat_N[icomp][data_idx] = n[icomp][ifile][i];
+      for (int jfile = 0; jfile < nhist; ++jfile) {
+        double a_val = -beta[jfile] * e[ifile][i];
+        for (int icomp = 0; icomp < ncompin; ++icomp) {
+          a_val += beta[jfile] * mu[jfile][icomp] * n[icomp][ifile][i];
+        }
+        A[data_idx * nhist + jfile] = a_val;
       }
       data_idx++;
     }
-  }
-
-  // Precalculate multipliers for A
-  std::vector<double> beta_neg(nhist);
-  std::vector<std::vector<double>> beta_mu(nhist, std::vector<double>(ncompin));
-  for (int jfile = 0; jfile < nhist; ++jfile) {
-      beta_neg[jfile] = -beta[jfile];
-      for (int icomp = 0; icomp < ncompin; ++icomp) {
-          beta_mu[jfile][icomp] = beta[jfile] * mu[jfile][icomp];
-      }
   }
 
   // Initialize weights using Mean-Energy Approximation for histograms without a
@@ -376,11 +368,7 @@ int main(int argc, char *argv[]) {
     if (oldweight[jfile] == 100000000.0) {
       double avg_A = 0.0;
       for (int i = 0; i < nentry[jfile]; ++i) {
-        double a_val = beta_neg[jfile] * flat_E[d_start + i];
-        for (int icomp = 0; icomp < ncompin; ++icomp) {
-          a_val += beta_mu[jfile][icomp] * flat_N[icomp][d_start + i];
-        }
-        avg_A += a_val;
+        avg_A += A[(d_start + i) * nhist + jfile];
       }
       if (nentry[jfile] > 0)
         avg_A /= nentry[jfile];
@@ -427,11 +415,7 @@ int main(int argc, char *argv[]) {
     for (int d = 0; d < N_total; ++d) {
       double ylog = -1e9;
       for (int jfile = 0; jfile < nhist; ++jfile) {
-        double a_val = beta_neg[jfile] * flat_E[d];
-        for (int icomp = 0; icomp < ncompin; ++icomp) {
-          a_val += beta_mu[jfile][icomp] * flat_N[icomp][d];
-        }
-        double tmp1 = a_val + log_N_over_f[jfile];
+        double tmp1 = A[d * nhist + jfile] + log_N_over_f[jfile];
         ylog = std::max(ylog, tmp1) + log(1.0 + exp(-fabs(ylog - tmp1)));
       }
       denom_log[d] = ylog;
@@ -466,11 +450,7 @@ int main(int argc, char *argv[]) {
 #pragma omp for schedule(static)
       for (int d = 0; d < N_total; ++d) {
         for (int kfile = 0; kfile < nhist; ++kfile) {
-          double a_val = beta_neg[kfile] * flat_E[d];
-          for (int icomp = 0; icomp < ncompin; ++icomp) {
-            a_val += beta_mu[kfile][icomp] * flat_N[icomp][d];
-          }
-          local_weights[kfile] += exp(a_val - denom_log[d]);
+          local_weights[kfile] += exp(A[d * nhist + kfile] - denom_log[d]);
         }
       }
 
@@ -596,6 +576,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  delete[] A;
   delete[] log_N_over_f;
   delete[] denom_log;
 
