@@ -43,6 +43,8 @@ struct HData {
     int maxp_global;
     vector<vector<double>> dens; // ncomp x (maxp - minp + 1)
     
+    vector<double> mw; // molecular weight of each component
+    
     double energy_gas, energy_liq;
 
     vector<vector<vector<int>>> n; // ncomp x nfiles x nentry
@@ -334,41 +336,106 @@ int main() {
 
     if (lphase) {
         cout << "Starting coexistence calculation\n";
-        ofstream f_phase("phase.dat", ios::app);
+        ofstream f_phase("phase.dat");
         f_phase << "/* Suffixes and Files = " << suffix;
         for(int ifile=0; ifile<hd.nfiles; ++ifile) f_phase << hd.filename[ifile] << " ";
-        f_phase << "\n/*      T            mu1           mu2        Eng_liq         Eng_gas       N_liq1          N_liq2        N_gas1         Ngas2  ln(Zliq) ln(Zgas)\n";
+        f_phase << "\n/*" << setw(12) << "T";
+        for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << "mu" + to_string(icomp+1);
+        f_phase << setw(14) << "Eng_liq" << setw(14) << "Eng_gas";
+        for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << "N_liq" + to_string(icomp+1);
+        for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << "N_gas" + to_string(icomp+1);
+        f_phase << setw(14) << "Rho_liq" << setw(14) << "Rho_gas";
+        f_phase << setw(14) << "ln(Zliq)" << setw(14) << "ln(Zgas)\n";
         f_phase.close();
 
+        ofstream f_trho_liq("trho_liq.dat");
+        f_trho_liq << "# Density(kg/m^3)   Tstar\n";
+        f_trho_liq.close();
+
+        ofstream f_trho_vap("trho_vap.dat");
+        f_trho_vap << "# Density(kg/m^3)   Tstar\n";
+        f_trho_vap.close();
+
         ifstream f_ph("phinput.idat");
-        string dummy;
-        if (lfixp) {
-            getline(f_ph, dummy);
-            if(hd.ncomp > 2) {
-                f_ph >> hd.mup[0] >> hd.mup[hd.ncomp-2] >> lnZ0 >> pset;
-            } else {
-                f_ph >> hd.mup[0] >> hd.mup[hd.ncomp-1] >> lnZ0 >> pset;
-            }
-            getline(f_ph, dummy);
+        if (!f_ph.is_open()) {
+            cout << "Warning: Could not open phinput.idat\n";
         } else {
-            getline(f_ph, dummy);
-            f_ph >> hd.mup[0];
-            getline(f_ph, dummy);
+            cout << "Successfully opened phinput.idat. Here are its contents:\n";
+            cout << "--------------------------------------------------\n";
+            string line;
+            while (getline(f_ph, line)) {
+                cout << line << endl;
+            }
+            cout << "--------------------------------------------------\n";
+            
+            // Re-open or clear the stream to parse properly
+            f_ph.clear();
+            f_ph.seekg(0);
+
+            // Line 1: Header
+            getline(f_ph, line);
+
+            // Line 2: Initial guess variables
+            getline(f_ph, line);
+            stringstream ss_mu(line);
+            if (lfixp) {
+                if(hd.ncomp > 2) {
+                    ss_mu >> hd.mup[0] >> hd.mup[hd.ncomp-2] >> lnZ0 >> pset;
+                } else {
+                    ss_mu >> hd.mup[0] >> hd.mup[hd.ncomp-1] >> lnZ0 >> pset;
+                }
+            } else {
+                ss_mu >> hd.mup[0] >> lnZ0;
+            }
+
+            // Lines 3+: Read MW if present, and any valid 6-parameter conditions
+            hd.mw.assign(hd.ncomp, 1.0); // default MW if not provided
+            bool next_line_is_mw = false;
+            
+            while (getline(f_ph, line)) {
+                if (next_line_is_mw) {
+                    stringstream ss_mw(line);
+                    for (int i = 0; i < hd.ncomp; ++i) {
+                        ss_mw >> hd.mw[i];
+                    }
+                    next_line_is_mw = false;
+                    continue;
+                }
+                
+                if (line.find("MW") != string::npos) {
+                    next_line_is_mw = true;
+                    continue;
+                }
+
+                stringstream ss(line);
+                double t, m2min, m2max, m2inc, nmid_val, slope_val;
+                if (ss >> t >> m2min >> m2max >> m2inc >> nmid_val >> slope_val) {
+                    t_new.push_back(t);
+                    mu2min.push_back(m2min);
+                    mu2max.push_back(m2max);
+                    mu2_incr.push_back(m2inc);
+                    hd.nmid.push_back(nmid_val);
+                    hd.slope.push_back(slope_val);
+                }
+            }
+            ntemp = t_new.size();
+            f_ph.close();
+            
+            cout << "Read " << ntemp << " conditions from phinput.idat:" << endl;
+            cout << "  lnZ0=" << lnZ0 << endl;
+            if (hd.ncomp > 0) {
+                cout << "  Parsed Molecular Weights: ";
+                for (int i = 0; i < hd.ncomp; ++i) cout << hd.mw[i] << " ";
+                cout << endl;
+            }
+            for (int i = 0; i < ntemp; ++i) {
+                cout << "  T=" << t_new[i] << " m2min=" << mu2min[i] << " m2max=" << mu2max[i] 
+                     << " m2inc=" << mu2_incr[i] << " nmid=" << hd.nmid[i] << " slope=" << hd.slope[i] << endl;
+            }
         }
-        double t, m2min, m2max, m2inc, nmid_val, slope_val;
-        while (f_ph >> t >> m2min >> m2max >> m2inc >> nmid_val >> slope_val) {
-            t_new.push_back(t);
-            mu2min.push_back(m2min);
-            mu2max.push_back(m2max);
-            mu2_incr.push_back(m2inc);
-            hd.nmid.push_back(nmid_val);
-            hd.slope.push_back(slope_val);
-        }
-        ntemp = t_new.size();
-        f_ph.close();
 
     } else if (lpvt) {
-        ofstream f_pvt("pvt.dat", ios::app);
+        ofstream f_pvt("pvt.dat");
         f_pvt << "/* Suffixes and Files = " << suffix;
         for(int ifile=0; ifile<hd.nfiles; ++ifile) f_pvt << hd.filename[ifile] << " ";
         f_pvt << "\n/*    mu1          mu2           <N>           lnZ\n";
@@ -471,15 +538,36 @@ int main() {
                 hd.energy_gas /= nbelow;
                 hd.energy_liq /= (1.0 - nbelow);
 
+                double rho_liq = 0.0, rho_gas = 0.0;
+                for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
+                    rho_liq += hd.nliq[icomp] * hd.mw[icomp];
+                    rho_gas += hd.ngas[icomp] * hd.mw[icomp];
+                }
+                // Convert N * (g/mol) / A^3 to kg/m^3
+                rho_liq = (rho_liq / vol) * 1660.53906717;
+                rho_gas = (rho_gas / vol) * 1660.53906717;
+
                 ofstream f_phase("phase.dat", ios::app);
                 f_phase << fixed << setprecision(4);
-                f_phase << 1.0/hd.betap << " ";
-                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << hd.mup[icomp] << " ";
-                f_phase << hd.energy_liq << " " << hd.energy_gas << " ";
-                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << hd.nliq[icomp] << " ";
-                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << hd.ngas[icomp] << " ";
-                f_phase << log(hd.Zliq) << " " << log(hd.Zgas) << "\n";
+                f_phase << "  " << setw(12) << 1.0/hd.betap;
+                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << hd.mup[icomp];
+                f_phase << setw(14) << hd.energy_liq << setw(14) << hd.energy_gas;
+                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << hd.nliq[icomp];
+                for(int icomp=0; icomp<hd.ncomp; ++icomp) f_phase << setw(14) << hd.ngas[icomp];
+                f_phase << setw(14) << rho_liq << setw(14) << rho_gas;
+                f_phase << setw(14) << log(hd.Zliq) << setw(14) << log(hd.Zgas) << "\n";
                 f_phase.close();
+
+                double larger_rho = std::max(rho_liq, rho_gas);
+                double smaller_rho = std::min(rho_liq, rho_gas);
+
+                ofstream f_tliq("trho_liq.dat", ios::app);
+                f_tliq << fixed << setprecision(4) << setw(16) << larger_rho << setw(12) << 1.0/hd.betap << "\n";
+                f_tliq.close();
+
+                ofstream f_tvap("trho_vap.dat", ios::app);
+                f_tvap << fixed << setprecision(4) << setw(16) << smaller_rho << setw(12) << 1.0/hd.betap << "\n";
+                f_tvap.close();
 
                 for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
                     string fname3 = "d" + to_string(icomp+1) + "n" + to_string(hd.tnum+1) + "t" + to_string(num) + "a.dat";
