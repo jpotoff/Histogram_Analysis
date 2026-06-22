@@ -382,7 +382,7 @@ int main(int argc, char *argv[]) {
   double *denom_log = new double[N_total];
 
   // DIIS parameters and buffers
-  const int diis_m = 5;
+  const int diis_m = 8;
   std::vector<std::vector<double>> diis_errs;
   std::vector<std::vector<double>> diis_weights;
 
@@ -490,7 +490,7 @@ int main(int argc, char *argv[]) {
             dot += diis_errs[i][k] * diis_errs[j][k];
           B[i][j] = B[j][i] = dot;
         }
-        B[i][i] = B[i][i] * (1.0 + 1e-6) + 1e-12; // Regularization to prevent singularity
+        B[i][i] = B[i][i] * (1.0 + 1e-8); // Lighter regularization to allow faster steps
         B[i][n_diis] = B[n_diis][i] = -1.0;
       }
       B[n_diis][n_diis] = 0.0;
@@ -525,8 +525,8 @@ int main(int argc, char *argv[]) {
       weight[kfile] = diis_used ? extrap_weight[kfile] : current_weight[kfile];
     }
 
-    // Clear DIIS if diverged numerically or oscillating
-    if (diis_used && (maxd > 10.0 || maxd > prev_maxd * 1.5)) {
+    // Clear DIIS if diverged numerically or oscillating excessively
+    if (diis_used && (maxd > 10.0 || maxd > prev_maxd * 5.0)) {
       diis_weights.clear();
       diis_errs.clear();
       for (int kfile = 0; kfile < nhist; ++kfile)
