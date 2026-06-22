@@ -317,6 +317,7 @@ int main(int argc, char *argv[]) {
 
   int iter = 0;
   double maxd = 100;
+  double prev_maxd = 100;
   double tol = 5e-5;
   double val;
   int N_total = 0;
@@ -458,12 +459,17 @@ int main(int argc, char *argv[]) {
       current_err[i] = current_weight[i] - oldweight[i];
     }
 
-    // Update DIIS buffers
-    diis_weights.push_back(current_weight);
-    diis_errs.push_back(current_err);
-    if (diis_weights.size() > diis_m) {
-      diis_weights.erase(diis_weights.begin());
-      diis_errs.erase(diis_errs.begin());
+    // Update DIIS buffers only when Picard starts converging well
+    if (prev_maxd < 5.0) {
+      diis_weights.push_back(current_weight);
+      diis_errs.push_back(current_err);
+      if (diis_weights.size() > diis_m) {
+        diis_weights.erase(diis_weights.begin());
+        diis_errs.erase(diis_errs.begin());
+      }
+    } else {
+      diis_weights.clear();
+      diis_errs.clear();
     }
 
     bool diis_used = false;
@@ -484,6 +490,7 @@ int main(int argc, char *argv[]) {
             dot += diis_errs[i][k] * diis_errs[j][k];
           B[i][j] = B[j][i] = dot;
         }
+        B[i][i] = B[i][i] * (1.0 + 1e-6) + 1e-12; // Regularization to prevent singularity
         B[i][n_diis] = B[n_diis][i] = -1.0;
       }
       B[n_diis][n_diis] = 0.0;
@@ -518,14 +525,15 @@ int main(int argc, char *argv[]) {
       weight[kfile] = diis_used ? extrap_weight[kfile] : current_weight[kfile];
     }
 
-    // Clear DIIS if diverged numerically
-    if (diis_used && maxd > 10.0) {
+    // Clear DIIS if diverged numerically or oscillating
+    if (diis_used && (maxd > 10.0 || maxd > prev_maxd * 1.5)) {
       diis_weights.clear();
       diis_errs.clear();
       for (int kfile = 0; kfile < nhist; ++kfile)
         weight[kfile] = current_weight[kfile];
       maxd = 100.0; // Force another iter
     }
+    prev_maxd = (maxd == 100.0) ? prev_maxd : maxd;
 
     // normalize weights
     for (int i = 1; i < nhist; ++i) {
