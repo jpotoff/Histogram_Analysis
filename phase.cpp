@@ -9,6 +9,10 @@
 
 #include <limits>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 using namespace std;
 
 // Constants
@@ -126,6 +130,271 @@ void Zcalc(double &nbelow) {
   hd.energy_gas /= hd.Z;
   hd.energy_liq /= hd.Z;
   nbelow /= hd.Z;
+}
+
+// Gaussian elimination for Ax = b
+// Solves in-place, modifying A and b. Returns false if singular.
+bool gauss_solve(vector<vector<double>> &A, vector<double> &b,
+                 vector<double> &x) {
+  int n = A.size();
+  for (int i = 0; i < n; i++) {
+    double maxEl = fabs(A[i][i]);
+    int maxRow = i;
+    for (int k = i + 1; k < n; k++) {
+      if (fabs(A[k][i]) > maxEl) {
+        maxEl = fabs(A[k][i]);
+        maxRow = k;
+      }
+    }
+    if (maxEl < 1e-20)
+      return false;
+
+    for (int k = i; k < n; k++)
+      swap(A[maxRow][k], A[i][k]);
+    swap(b[maxRow], b[i]);
+
+    for (int k = i + 1; k < n; k++) {
+      double c = -A[k][i] / A[i][i];
+      for (int j = i; j < n; j++) {
+        if (i == j)
+          A[k][j] = 0;
+        else
+          A[k][j] += c * A[i][j];
+      }
+      b[k] += c * b[i];
+    }
+  }
+  x.assign(n, 0.0);
+  for (int i = n - 1; i >= 0; i--) {
+    x[i] = b[i];
+    for (int k = i + 1; k < n; k++)
+      x[i] -= A[i][k] * x[k];
+    x[i] = x[i] / A[i][i];
+  }
+  return true;
+}
+
+// Refine hd.oldweight (read from input_fsp2.dat) by Newton-Raphson in log
+// space; same solver as patch.cpp.  With g_j = ln(weight_j), the weights are
+// the minimizer of the convex function (Shirts & Chodera, J. Chem. Phys. 129,
+// 124105 (2008))
+//   Phi(g) = sum_d log sum_j N_j exp(A_dj - g_j) + sum_j N_j g_j,
+//   A_dj = -beta_j E_d + sum_c beta_j mu_cj N_cd,
+// whose gradient is grad_k = N_k - W_k, with W_k / N_k = (fixed-point
+// update) / (current weight).  Converged when maxd = max_k |W_k / N_k - 1|
+// <= tol and the Newton step changes every ln(weight) by less than step_tol.
+// On return hd.weight = hd.oldweight = converged weights, weight[0] = 1.
+// Returns the number of iterations.
+int solve_weights(double tol) {
+  const int nf = hd.nfiles;
+  const int max_iter = 1000;
+  const double max_step = 1000.0; // largest allowed change in any ln(weight)
+  const double step_tol = 1e-6;   // converged ln(weight) changes less than this
+
+  long N_total = 0;
+  for (int j = 0; j < nf; ++j)
+    N_total += hd.nentry[j];
+
+  vector<double> A(N_total * nf);
+  long data_idx = 0;
+  for (int ifile = 0; ifile < nf; ++ifile) {
+    for (int i = 0; i < hd.nentry[ifile]; ++i) {
+      for (int jfile = 0; jfile < nf; ++jfile) {
+        double a_val = -hd.beta[jfile] * hd.e[ifile][i];
+        for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
+          a_val += hd.beta[jfile] * hd.mu[icomp][jfile] * hd.n[icomp][ifile][i];
+        }
+        A[data_idx * nf + jfile] = a_val;
+      }
+      data_idx++;
+    }
+  }
+
+  vector<double> g(nf), log_N(nf);
+  for (int j = 0; j < nf; ++j) {
+    if (!(hd.oldweight[j] > 0.0) || !isfinite(hd.oldweight[j])) {
+      cerr << "Invalid weight " << hd.oldweight[j] << " for histogram "
+           << hd.filename[j] << " in input_fsp2.dat\n";
+      exit(1);
+    }
+    g[j] = log(hd.oldweight[j]) - log(hd.oldweight[0]);
+    log_N[j] = log((double)hd.nentry[j]);
+  }
+  vector<double> denom_log(N_total);
+
+  // Evaluates Phi(gg) and fills denom_log[d] = log sum_j N_j exp(A_dj - gg_j)
+  auto objective = [&](const vector<double> &gg) {
+    double phi = 0.0;
+#pragma omp parallel for reduction(+ : phi)
+    for (long d = 0; d < N_total; ++d) {
+      double ymax = -1e300;
+      for (int j = 0; j < nf; ++j)
+        ymax = max(ymax, A[d * nf + j] + log_N[j] - gg[j]);
+      double sum = 0.0;
+      for (int j = 0; j < nf; ++j)
+        sum += exp(A[d * nf + j] + log_N[j] - gg[j] - ymax);
+      denom_log[d] = ymax + log(sum);
+      phi += denom_log[d];
+    }
+    for (int j = 0; j < nf; ++j)
+      phi += hd.nentry[j] * gg[j];
+    return phi;
+  };
+
+  int nthreads = 1;
+#ifdef _OPENMP
+#pragma omp parallel
+  {
+#pragma omp single
+    nthreads = omp_get_num_threads();
+  }
+#endif
+
+  double phi = objective(g);
+  vector<double> W(nf), grad(nf), H(nf * nf);
+  int iter = 0;
+  double maxd = 0.0;
+
+  while (true) {
+    ++iter;
+
+    // W_k = sum_d p_dk and Hessian H_kl = sum_d (p_dk delta_kl - p_dk p_dl),
+    // with p_dk = N_k exp(A_dk - g_k) / denom_d.  Per-thread accumulation
+    // followed by a deterministic reduction.
+    vector<vector<double>> thread_W(nthreads, vector<double>(nf, 0.0));
+    vector<vector<double>> thread_H(nthreads, vector<double>(nf * nf, 0.0));
+#pragma omp parallel
+    {
+      int tid = 0;
+#ifdef _OPENMP
+      tid = omp_get_thread_num();
+#endif
+      vector<double> lW(nf, 0.0), lH(nf * nf, 0.0), p(nf);
+#pragma omp for schedule(static)
+      for (long d = 0; d < N_total; ++d) {
+        for (int k = 0; k < nf; ++k) {
+          p[k] = exp(A[d * nf + k] + log_N[k] - g[k] - denom_log[d]);
+          lW[k] += p[k];
+        }
+        // Diagonal written as p_k * sum_{j!=k} p_j rather than p_k - p_k^2,
+        // which cancels catastrophically when one histogram has p_k ~ 1
+        for (int k = 0; k < nf; ++k)
+          for (int l = 0; l < nf; ++l)
+            if (l != k) {
+              lH[k * nf + l] -= p[k] * p[l];
+              lH[k * nf + k] += p[k] * p[l];
+            }
+      }
+      thread_W[tid] = lW;
+      thread_H[tid] = lH;
+    }
+    fill(W.begin(), W.end(), 0.0);
+    fill(H.begin(), H.end(), 0.0);
+    for (int t = 0; t < nthreads; ++t) {
+      for (int k = 0; k < nf; ++k)
+        W[k] += thread_W[t][k];
+      for (int kl = 0; kl < nf * nf; ++kl)
+        H[kl] += thread_H[t][kl];
+    }
+    maxd = 0.0;
+    for (int k = 0; k < nf; ++k) {
+      grad[k] = hd.nentry[k] - W[k];
+      maxd = max(maxd, fabs(W[k] / hd.nentry[k] - 1.0));
+    }
+    if (!isfinite(maxd)) {
+      cerr << "Error: non-finite weights at iteration " << iter << endl;
+      exit(1);
+    }
+
+    // Newton step on the reduced system (g_0 held fixed)
+    int nr = nf - 1;
+    vector<vector<double>> Hr(nr, vector<double>(nr));
+    vector<double> rhs(nr), step_r;
+    for (int k = 0; k < nr; ++k) {
+      rhs[k] = -grad[k + 1];
+      for (int l = 0; l < nr; ++l)
+        Hr[k][l] = H[(k + 1) * nf + (l + 1)];
+    }
+    vector<double> step(nf, 0.0);
+    bool newton_ok = gauss_solve(Hr, rhs, step_r);
+    double max_newton = 0.0;
+    if (newton_ok) {
+      for (int k = 0; k < nr; ++k) {
+        step[k + 1] = step_r[k];
+        max_newton = max(max_newton, fabs(step_r[k]));
+      }
+    }
+
+    cout << "iteration = " << setw(5) << iter << "     deviation = "
+         << scientific << setprecision(4) << maxd;
+    if (newton_ok)
+      cout << "     Newton step = " << max_newton;
+    cout << fixed << endl;
+
+    // A small maxd alone is not enough: a weakly overlapping histogram can
+    // still be off in ln(weight), so also require the Newton step to vanish
+    if ((maxd <= tol && newton_ok && max_newton <= step_tol) ||
+        iter >= max_iter)
+      break;
+
+    // Backtracking line search on Phi along step (Armijo condition).
+    // Updates g, phi and denom_log and returns true on success.
+    vector<double> g_new(nf);
+    auto line_search = [&](vector<double> step) {
+      double big = 0.0;
+      for (int k = 0; k < nf; ++k)
+        big = max(big, fabs(step[k]));
+      if (big > max_step)
+        for (int k = 0; k < nf; ++k)
+          step[k] *= max_step / big;
+      double slope = 0.0;
+      for (int k = 0; k < nf; ++k)
+        slope += grad[k] * step[k];
+      if (!(slope < 0.0))
+        return false; // not a descent direction
+      double lambda = 1.0;
+      for (int ls = 0; ls < 40; ++ls) {
+        for (int k = 0; k < nf; ++k)
+          g_new[k] = g[k] + lambda * step[k];
+        double phi_new = objective(g_new);
+        if (phi_new <= phi + 1e-4 * lambda * slope + 1e-12 * fabs(phi)) {
+          g = g_new;
+          phi = phi_new; // denom_log now corresponds to g
+          return true;
+        }
+        lambda *= 0.5;
+      }
+      objective(g); // restore denom_log for the unchanged g
+      return false;
+    };
+
+    bool moved = false;
+    if (newton_ok)
+      moved = line_search(step);
+    if (!moved) {
+      // Newton failed (nearly singular Hessian far from the solution, where
+      // histograms do not yet overlap): take a fixed-point step instead
+      for (int k = 1; k < nf; ++k)
+        step[k] = log(max(W[k], 1e-300) / hd.nentry[k]) -
+                  log(max(W[0], 1e-300) / hd.nentry[0]);
+      moved = line_search(step);
+    }
+    if (!moved) {
+      cerr << "Error: line search failed at iteration " << iter << endl;
+      break;
+    }
+  }
+
+  if (iter >= max_iter) {
+    cerr << "Warning: weights did not converge in " << max_iter
+         << " iterations (deviation = " << scientific << maxd << ")" << fixed
+         << endl;
+  }
+  for (int j = 0; j < nf; ++j) {
+    hd.weight[j] = exp(g[j]);
+    hd.oldweight[j] = hd.weight[j];
+  }
+  return iter;
 }
 
 int main() {
@@ -310,43 +579,7 @@ int main() {
   hd.dens.assign(hd.ncomp,
                  vector<double>(hd.maxp_global - hd.minp_global + 1, 0.0));
 
-  int iter = 0;
-  double maxd = 100.0;
-  while (maxd > tolerance && iter < 1e4) {
-    iter++;
-    maxd = 0.0;
-    for (int kfile = 0; kfile < hd.nfiles; ++kfile) {
-      hd.weight[kfile] = 0.0;
-      for (int ifile = 0; ifile < hd.nfiles; ++ifile) {
-        for (int i = 0; i < hd.nentry[ifile]; ++i) {
-          double ylog = -1e9;
-          for (int jfile = 0; jfile < hd.nfiles; ++jfile) {
-            double prob = -(hd.beta[jfile] - hd.beta[kfile]) * hd.e[ifile][i];
-            for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
-              prob += (hd.beta[jfile] * hd.mu[icomp][jfile] -
-                       hd.beta[kfile] * hd.mu[icomp][kfile]) *
-                      hd.n[icomp][ifile][i];
-            }
-            double tmp1 = prob + log(hd.nentry[jfile] / hd.oldweight[jfile]);
-            ylog = max(ylog, tmp1) + log(1.0 + exp(-abs(ylog - tmp1)));
-          }
-          hd.weight[kfile] += exp(-ylog);
-        }
-      }
-      double val = abs(hd.weight[kfile] / hd.oldweight[kfile] - 1.0);
-      if (val > maxd)
-        maxd = val;
-    }
-    for (int i = 1; i < hd.nfiles; ++i) {
-      hd.weight[i] = hd.weight[i] / hd.weight[0];
-    }
-    hd.weight[0] = 1.0;
-    for (int i = 0; i < hd.nfiles; ++i) {
-      hd.oldweight[i] = hd.weight[i];
-    }
-    cout << "iteration = " << setw(5) << iter << "     deviation = " << fixed
-         << setprecision(6) << maxd << endl;
-  }
+  int iter = solve_weights(tolerance);
 
   ofstream f_out24("input_fsp2.dat");
   f_out24 << hd.ncomp << "\n" << hd.nfiles << "\n" << suffix << "\n";

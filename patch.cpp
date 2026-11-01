@@ -119,6 +119,16 @@ int main(int argc, char *argv[]) {
 
   fin.close();
 
+  for (int i = 0; i < nhist; ++i) {
+    for (int j = 0; j < i; ++j) {
+      if (histid[i] == histid[j]) {
+        cerr << "Error: histogram " << histid[i]
+             << " is listed more than once in input_hs.dat" << endl;
+        exit(1);
+      }
+    }
+  }
+
   // build filenames and read histograms
 
   double *t = new double[nhist];
@@ -170,7 +180,9 @@ int main(int argc, char *argv[]) {
   int nhist_old;
   bool oldrun;
 
-  // see if we already have weights to use as an initial guess
+  // see if we already have weights to use as an initial guess.  The
+  // histograms in weights.dat must be the first entries of input_hs.dat, in
+  // the same order; new histograms may only be appended to the end.
   ifstream fin2;
   fin2.open("weights.dat");
   if (fin2) {
@@ -178,18 +190,65 @@ int main(int argc, char *argv[]) {
     cout << "Reading weights from: weights.dat" << endl;
     cout << setfill('=') << setw(60) << "=" << setfill(' ') << endl;
 
-    int i = 0;
-    string temp;
+    string suffix_old;
     fin2 >> ncompin_old;
     fin2 >> nhist_old;
-    fin2 >> suffix;
+    fin2 >> suffix_old;
+    if (!fin2) {
+      cerr << "Error: could not read the header of weights.dat" << endl;
+      exit(1);
+    }
+    if (ncompin_old != ncompin) {
+      cerr << "Error: weights.dat is for a " << ncompin_old
+           << " component system, but input_hs.dat specifies " << ncompin
+           << " components" << endl;
+      exit(1);
+    }
+    if (suffix_old != suffix) {
+      cerr << "Error: weights.dat was generated for suffix '" << suffix_old
+           << "', but input_hs.dat specifies suffix '" << suffix << "'"
+           << endl;
+      exit(1);
+    }
+    if (nhist_old > nhist) {
+      cerr << "Error: weights.dat contains " << nhist_old
+           << " histograms, but input_hs.dat lists only " << nhist << endl;
+      cerr << "Histograms may only be added to the end of input_hs.dat. "
+              "Delete weights.dat to start from scratch."
+           << endl;
+      exit(1);
+    }
+    string temp;
     for (int i = 0; i < nhist_old; ++i) {
-      fin2 >> histid[i] >> temp >> oldweight[i] >> t[i];
+      int id_old;
+      fin2 >> id_old >> temp >> oldweight[i] >> t[i];
+      for (int c = 0; c < ncompin; ++c) {
+        fin2 >> mu[i][c];
+      }
+      if (!fin2) {
+        cerr << "Error: could not read entry " << i + 1 << " of weights.dat"
+             << endl;
+        exit(1);
+      }
+      if (id_old != histid[i]) {
+        cerr << "Error: histogram order in input_hs.dat does not match "
+                "weights.dat"
+             << endl;
+        cerr << "Entry " << i + 1 << " is histogram " << histid[i]
+             << " in input_hs.dat but histogram " << id_old
+             << " in weights.dat" << endl;
+        cerr << "The histograms in weights.dat must be listed first in "
+                "input_hs.dat, in the same order;"
+             << endl;
+        cerr << "new histograms may only be added to the end. Fix "
+                "input_hs.dat, or delete weights.dat to start from scratch."
+             << endl;
+        exit(1);
+      }
       cout << setw(4) << histid[i] << std::scientific << setprecision(6)
            << setw(14) << oldweight[i] << std::fixed << setprecision(2)
            << setw(8) << t[i];
       for (int c = 0; c < ncompin; ++c) {
-        fin2 >> mu[i][c];
         cout << setw(10) << mu[i][c];
       }
       cout << endl;
@@ -317,9 +376,7 @@ int main(int argc, char *argv[]) {
 
   int iter = 0;
   double maxd = 100;
-  double prev_maxd = 100;
   double tol = 5e-5;
-  double val;
   int N_total = 0;
 
   for (int i = 0; i < nhist; ++i) {
@@ -347,7 +404,6 @@ int main(int argc, char *argv[]) {
   // starting guess
   int d_start = 0;
   vector<double> log_w(nhist, 0.0);
-  bool has_new_weights = false;
 
   for (int jfile = 0; jfile < nhist; ++jfile) {
     if (oldweight[jfile] == 100000000.0) {
@@ -358,193 +414,161 @@ int main(int argc, char *argv[]) {
       if (nentry[jfile] > 0)
         avg_A /= nentry[jfile];
       log_w[jfile] = avg_A;
-      has_new_weights = true;
-    }
+          }
     d_start += nentry[jfile];
   }
 
-  if (has_new_weights) {
-    double max_log = -1e9;
-    for (int jfile = 0; jfile < nhist; ++jfile) {
-      if (oldweight[jfile] == 100000000.0 && log_w[jfile] > max_log) {
-        max_log = log_w[jfile];
-      }
-    }
-    for (int jfile = 0; jfile < nhist; ++jfile) {
-      if (oldweight[jfile] == 100000000.0) {
-        // exp(avg_A - max) ensures it is bounded between 0 and 1
-        oldweight[jfile] = exp(log_w[jfile] - max_log);
-      }
+  // Histograms without a starting weight get ln(weight) = <A>_j, shifted by
+  // the largest such value.  This is kept in log form: for large systems
+  // ln(weight) spans thousands and exp() would overflow or underflow.
+  double max_log = -1e300;
+  for (int jfile = 0; jfile < nhist; ++jfile) {
+    if (oldweight[jfile] == 100000000.0 && log_w[jfile] > max_log) {
+      max_log = log_w[jfile];
     }
   }
 
-  double *log_N_over_f = new double[nhist];
+  // Solve the self-consistent histogram equations by Newton-Raphson in log
+  // space.  With g_j = ln(weight_j), the weights are the minimizer of the
+  // convex function (Shirts & Chodera, J. Chem. Phys. 129, 124105 (2008))
+  //   Phi(g) = sum_d log sum_j N_j exp(A_dj - g_j) + sum_j N_j g_j
+  // whose gradient is grad_k = N_k - W_k, with W_k / N_k = (fixed-point
+  // update) / (current weight).  grad = 0 is the same solution as the old
+  // iteration, and maxd = max_k |W_k / N_k - 1| is the same convergence test.
+  // Working with ln(weight) avoids the many decades spanned by the weights.
+  // g_0 = 0 fixes the arbitrary normalization.
+  vector<double> g(nhist), log_N(nhist);
+  for (int j = 0; j < nhist; ++j) {
+    g[j] = (oldweight[j] == 100000000.0) ? log_w[j] - max_log
+                                          : log(oldweight[j]);
+    log_N[j] = log((double)nentry[j]);
+  }
+  for (int j = nhist - 1; j >= 0; --j)
+    g[j] -= g[0];
   double *denom_log = new double[N_total];
 
-  // DIIS parameters and buffers
-  const int diis_m = 8;
-  std::vector<std::vector<double>> diis_errs;
-  std::vector<std::vector<double>> diis_weights;
-
-  while (maxd > tol && iter < 1e4) {
-    ++iter;
-    maxd = 0.0;
-
-    // 1. Precalculate loop invariants for this iteration
-    for (int jfile = 0; jfile < nhist; ++jfile) {
-      log_N_over_f[jfile] = log(nentry[jfile] / oldweight[jfile]);
-    }
-
-// 2. Compute denominator log-sum-exp for each data point
-#pragma omp parallel for
+  // Evaluates Phi(gg) and fills denom_log[d] = log sum_j N_j exp(A_dj - gg_j)
+  auto objective = [&](const vector<double> &gg) {
+    double phi = 0.0;
+#pragma omp parallel for reduction(+ : phi)
     for (int d = 0; d < N_total; ++d) {
-      double ylog = -1e9;
-      for (int jfile = 0; jfile < nhist; ++jfile) {
-        double tmp1 = A[d * nhist + jfile] + log_N_over_f[jfile];
-        ylog = std::max(ylog, tmp1) + log(1.0 + exp(-fabs(ylog - tmp1)));
-      }
-      denom_log[d] = ylog;
+      double ymax = -1e300;
+      for (int j = 0; j < nhist; ++j)
+        ymax = std::max(ymax, A[d * nhist + j] + log_N[j] - gg[j]);
+      double sum = 0.0;
+      for (int j = 0; j < nhist; ++j)
+        sum += exp(A[d * nhist + j] + log_N[j] - gg[j] - ymax);
+      denom_log[d] = ymax + log(sum);
+      phi += denom_log[d];
     }
+    for (int j = 0; j < nhist; ++j)
+      phi += nentry[j] * gg[j];
+    return phi;
+  };
 
-    std::vector<double> current_weight(nhist, 0.0);
-
-    int nthreads = 1;
+  int nthreads = 1;
 #pragma omp parallel
-    {
+  {
 #pragma omp single
 #ifdef _OPENMP
-      nthreads = omp_get_num_threads();
+    nthreads = omp_get_num_threads();
 #else
-      nthreads = 1;
+    nthreads = 1;
 #endif
-    }
+  }
 
-    std::vector<std::vector<double>> thread_weights(
-        nthreads, std::vector<double>(nhist, 0.0));
+  const int max_iter = 1000;
+  const double max_step = 1000.0; // largest allowed change in any ln(weight)
+  const double step_tol = 1e-6;   // converged ln(weight) changes less than this
+  double phi = objective(g);
+  vector<double> W(nhist), grad(nhist), H(nhist * nhist);
 
+  while (true) {
+    ++iter;
+
+    // W_k = sum_d p_dk and Hessian H_kl = sum_d (p_dk delta_kl - p_dk p_dl),
+    // with p_dk = N_k exp(A_dk - g_k) / denom_d.  Per-thread accumulation
+    // followed by a deterministic reduction.
+    vector<vector<double>> thread_W(nthreads, vector<double>(nhist, 0.0));
+    vector<vector<double>> thread_H(nthreads,
+                                    vector<double>(nhist * nhist, 0.0));
 #pragma omp parallel
     {
       int tid = 0;
 #ifdef _OPENMP
       tid = omp_get_thread_num();
 #endif
-      // Use a purely local array to prevent False Sharing (cache line
-      // contention) between threads
-      std::vector<double> local_weights(nhist, 0.0);
-
+      vector<double> lW(nhist, 0.0), lH(nhist * nhist, 0.0), p(nhist);
 #pragma omp for schedule(static)
       for (int d = 0; d < N_total; ++d) {
-        for (int kfile = 0; kfile < nhist; ++kfile) {
-          local_weights[kfile] += exp(A[d * nhist + kfile] - denom_log[d]);
-        }
-      }
-
-      // Write back to the shared array only once at the very end
-      for (int kfile = 0; kfile < nhist; ++kfile) {
-        thread_weights[tid][kfile] = local_weights[kfile];
-      }
-    }
-
-    // Deterministic reduction to prevent floating-point noise from
-    // destabilizing DIIS
-    for (int t = 0; t < nthreads; ++t) {
-      for (int kfile = 0; kfile < nhist; ++kfile) {
-        current_weight[kfile] += thread_weights[t][kfile];
-      }
-    }
-
-    // Calculate errors for DIIS
-    std::vector<double> current_err(nhist, 0.0);
-    for (int i = 0; i < nhist; ++i) {
-      current_err[i] = current_weight[i] - oldweight[i];
-    }
-
-    // Update DIIS buffers only when Picard starts converging well
-    if (prev_maxd < 5.0) {
-      diis_weights.push_back(current_weight);
-      diis_errs.push_back(current_err);
-      if (diis_weights.size() > diis_m) {
-        diis_weights.erase(diis_weights.begin());
-        diis_errs.erase(diis_errs.begin());
-      }
-    } else {
-      diis_weights.clear();
-      diis_errs.clear();
-    }
-
-    bool diis_used = false;
-    std::vector<double> extrap_weight(nhist, 0.0);
-
-    // Attempt DIIS extrapolation
-    int n_diis = diis_errs.size();
-    if (n_diis >= 3) {
-      std::vector<std::vector<double>> B(n_diis + 1,
-                                         std::vector<double>(n_diis + 1, 0.0));
-      std::vector<double> b_vec(n_diis + 1, 0.0);
-      std::vector<double> c_vec(n_diis + 1, 0.0);
-
-      for (int i = 0; i < n_diis; ++i) {
-        for (int j = 0; j <= i; ++j) {
-          double dot = 0.0;
-          for (int k = 0; k < nhist; ++k)
-            dot += diis_errs[i][k] * diis_errs[j][k];
-          B[i][j] = B[j][i] = dot;
-        }
-        B[i][i] = B[i][i] * (1.0 + 1e-8); // Lighter regularization to allow faster steps
-        B[i][n_diis] = B[n_diis][i] = -1.0;
-      }
-      B[n_diis][n_diis] = 0.0;
-      b_vec[n_diis] = -1.0;
-
-      if (gauss_solve(B, b_vec, c_vec)) {
-        for (int i = 0; i < n_diis; ++i) {
-          for (int k = 0; k < nhist; ++k) {
-            extrap_weight[k] += c_vec[i] * diis_weights[i][k];
-          }
-        }
-        bool valid = true;
         for (int k = 0; k < nhist; ++k) {
-          if (extrap_weight[k] <= 0.0 || std::isnan(extrap_weight[k]))
-            valid = false;
+          p[k] = exp(A[d * nhist + k] + log_N[k] - g[k] - denom_log[d]);
+          lW[k] += p[k];
         }
-        if (valid)
-          diis_used = true;
+        // Diagonal written as p_k * sum_{j!=k} p_j rather than p_k - p_k^2,
+        // which cancels catastrophically when one histogram has p_k ~ 1
+        for (int k = 0; k < nhist; ++k)
+          for (int l = 0; l < nhist; ++l)
+            if (l != k) {
+              lH[k * nhist + l] -= p[k] * p[l];
+              lH[k * nhist + k] += p[k] * p[l];
+            }
+      }
+      thread_W[tid] = lW;
+      thread_H[tid] = lH;
+    }
+    std::fill(W.begin(), W.end(), 0.0);
+    std::fill(H.begin(), H.end(), 0.0);
+    for (int t = 0; t < nthreads; ++t) {
+      for (int k = 0; k < nhist; ++k)
+        W[k] += thread_W[t][k];
+      for (int kl = 0; kl < nhist * nhist; ++kl)
+        H[kl] += thread_H[t][kl];
+    }
+    maxd = 0.0;
+    for (int k = 0; k < nhist; ++k) {
+      grad[k] = nentry[k] - W[k];
+      maxd = std::max(maxd, fabs(W[k] / nentry[k] - 1.0));
+    }
+    if (!std::isfinite(maxd)) {
+      cerr << "Error: non-finite weights at iteration " << iter << endl;
+      exit(1);
+    }
+
+    // Newton step on the reduced system (g_0 held fixed)
+    int nr = nhist - 1;
+    vector<vector<double>> Hr(nr, vector<double>(nr));
+    vector<double> rhs(nr), step_r;
+    for (int k = 0; k < nr; ++k) {
+      rhs[k] = -grad[k + 1];
+      for (int l = 0; l < nr; ++l)
+        Hr[k][l] = H[(k + 1) * nhist + (l + 1)];
+    }
+    vector<double> step(nhist, 0.0);
+    bool newton_ok = gauss_solve(Hr, rhs, step_r);
+    double max_newton = 0.0;
+    if (newton_ok) {
+      for (int k = 0; k < nr; ++k) {
+        step[k + 1] = step_r[k];
+        max_newton = std::max(max_newton, fabs(step_r[k]));
       }
     }
 
-    // Determine maxd using the non-extrapolated fixed point step for true
-    // convergence
-    for (int kfile = 0; kfile < nhist; ++kfile) {
-      val = fabs(current_weight[kfile] / oldweight[kfile] - 1.0);
-      if (val > maxd)
-        maxd = val;
-    }
+    // A small maxd alone is not enough: a weakly overlapping histogram can
+    // still be off in ln(weight), so also require the Newton step to vanish
+    bool done = (maxd <= tol && newton_ok && max_newton <= step_tol) ||
+                iter >= max_iter;
 
-    // Assign the new weight, using extrapolation if successful
-    for (int kfile = 0; kfile < nhist; ++kfile) {
-      weight[kfile] = diis_used ? extrap_weight[kfile] : current_weight[kfile];
-    }
+    cout << "Iteration " << setw(5) << iter << "   convergence = "
+         << std::scientific << setprecision(4) << maxd;
+    if (newton_ok)
+      cout << "   Newton step = " << max_newton;
+    cout << std::fixed << endl;
 
-    // Clear DIIS if diverged numerically or oscillating excessively
-    if (diis_used && (maxd > 10.0 || maxd > prev_maxd * 5.0)) {
-      diis_weights.clear();
-      diis_errs.clear();
-      for (int kfile = 0; kfile < nhist; ++kfile)
-        weight[kfile] = current_weight[kfile];
-      maxd = 100.0; // Force another iter
-    }
-    prev_maxd = (maxd == 100.0) ? prev_maxd : maxd;
-
-    // normalize weights
-    for (int i = 1; i < nhist; ++i) {
-      weight[i] = weight[i] / weight[0];
-      oldweight[i] = weight[i];
-    }
-    weight[0] = 1.0;
-    oldweight[0] = weight[0];
-
-    // Conditional output: write every 10 iterations or at convergence
-    if (iter % 10 == 0 || maxd <= tol) {
+    // Conditional output: write every 10 iterations or at the end
+    if (iter % 10 == 0 || done) {
+      for (int j = 0; j < nhist; ++j)
+        weight[j] = exp(g[j]);
       ofstream fout;
       fout.open("weights.dat");
       if (!fout.is_open()) {
@@ -569,10 +593,64 @@ int main(int argc, char *argv[]) {
            << " (s)" << endl;
       fout.close();
     }
+    if (done)
+      break;
+
+    // Backtracking line search on Phi along step (Armijo condition).
+    // Updates g, phi and denom_log and returns true on success.
+    vector<double> g_new(nhist);
+    auto line_search = [&](vector<double> step) {
+      double big = 0.0;
+      for (int k = 0; k < nhist; ++k)
+        big = std::max(big, fabs(step[k]));
+      if (big > max_step)
+        for (int k = 0; k < nhist; ++k)
+          step[k] *= max_step / big;
+      double slope = 0.0;
+      for (int k = 0; k < nhist; ++k)
+        slope += grad[k] * step[k];
+      if (!(slope < 0.0))
+        return false; // not a descent direction
+      double lambda = 1.0;
+      for (int ls = 0; ls < 40; ++ls) {
+        for (int k = 0; k < nhist; ++k)
+          g_new[k] = g[k] + lambda * step[k];
+        double phi_new = objective(g_new);
+        if (phi_new <= phi + 1e-4 * lambda * slope + 1e-12 * fabs(phi)) {
+          g = g_new;
+          phi = phi_new; // denom_log now corresponds to g
+          return true;
+        }
+        lambda *= 0.5;
+      }
+      objective(g); // restore denom_log for the unchanged g
+      return false;
+    };
+
+    bool moved = false;
+    if (newton_ok)
+      moved = line_search(step);
+    if (!moved) {
+      // Newton failed (nearly singular Hessian far from the solution, where
+      // histograms do not yet overlap): take a fixed-point step instead
+      for (int k = 1; k < nhist; ++k)
+        step[k] = log(std::max(W[k], 1e-300) / nentry[k]) -
+                  log(std::max(W[0], 1e-300) / nentry[0]);
+      moved = line_search(step);
+    }
+    if (!moved) {
+      cerr << "Error: line search failed at iteration " << iter << endl;
+      break;
+    }
+  }
+
+  if (iter >= max_iter) {
+    cerr << "Warning: weights did not converge in " << max_iter
+         << " iterations (convergence = " << std::scientific << maxd << ")"
+         << endl;
   }
 
   delete[] A;
-  delete[] log_N_over_f;
   delete[] denom_log;
 
   return 0;
