@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <limits>
+#include <sstream>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -54,6 +55,35 @@ struct HData {
   vector<vector<vector<int>>> n; // ncomp x nfiles x nentry
   vector<vector<double>> e;      // nfiles x nentry
 } hd;
+
+// Parses one data line of a histogram file: ncomp integer particle numbers
+// followed by the energy.  The whole line must be consumed, so a truncated,
+// non-numeric or non-integer field is reported instead of silently ending
+// the read.  Returns false on a malformed line.
+bool parse_entry(const string &line, int ncomp, vector<int> &nvals,
+                 double &energy) {
+  istringstream ss(line);
+  string tok;
+  size_t pos;
+  try {
+    for (int c = 0; c < ncomp; ++c) {
+      if (!(ss >> tok))
+        return false;
+      long v = stol(tok, &pos);
+      if (pos != tok.size())
+        return false;
+      nvals[c] = (int)v;
+    }
+    if (!(ss >> tok))
+      return false;
+    energy = stod(tok, &pos);
+    if (pos != tok.size())
+      return false;
+  } catch (const exception &) {
+    return false;
+  }
+  return !(ss >> tok); // nothing may follow the energy
+}
 
 void Zcalc(double &nbelow) {
   nbelow = 0.0;
@@ -430,6 +460,11 @@ int main() {
   }
   string suffix;
   f_input >> hd.ncomp >> hd.nfiles >> suffix;
+  if (!f_input || hd.ncomp < 1 || hd.nfiles < 1) {
+    cerr << "input_fsp2.dat must start with the number of components, the "
+            "number of histograms and the file suffix\n";
+    return 1;
+  }
 
   vector<double> dmup(hd.ncomp);
   hd.avgnum.resize(hd.ncomp);
@@ -457,6 +492,12 @@ int main() {
         hd.beta[ifile];
     for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
       f_input >> hd.mu[icomp][ifile];
+    }
+    if (!f_input) {
+      cerr << "input_fsp2.dat specifies " << hd.nfiles
+           << " histograms but entry " << ifile + 1
+           << " is missing or malformed\n";
+      return 1;
     }
     hd.beta[ifile] = 1.0 / hd.beta[ifile];
   }
@@ -487,14 +528,25 @@ int main() {
       return 1;
     }
 
-    double beta_val;
-    int ncomp2;
-    f_his >> beta_val >> ncomp2;
-    vector<double> mu_tmp(ncomp2);
-    for (int icomp = 0; icomp < ncomp2; ++icomp)
-      f_his >> mu_tmp[icomp];
-    double xdim1, ydim1, zdim1;
-    f_his >> xdim1 >> ydim1 >> zdim1;
+    // header: T, number of components, chemical potentials and box
+    // dimensions, all on the first line
+    double beta_val = 0.0;
+    int ncomp2 = 0;
+    double xdim1 = 0, ydim1 = 0, zdim1 = 0;
+    string line;
+    getline(f_his, line);
+    istringstream header(line);
+    header >> beta_val >> ncomp2;
+    if (header && ncomp2 == hd.ncomp) {
+      double mu_tmp;
+      for (int icomp = 0; icomp < ncomp2; ++icomp)
+        header >> mu_tmp;
+      header >> xdim1 >> ydim1 >> zdim1;
+    }
+    if (!header) {
+      cerr << "Could not read the header (line 1) of " << hname << endl;
+      return 1;
+    }
 
     if (hd.ncomp != ncomp2) {
       cout << "Number of components do not match in input_hs.dat and "
@@ -518,18 +570,25 @@ int main() {
     vector<vector<int>> n_temp(hd.ncomp);
     vector<double> e_temp;
 
-    while (true) {
-      vector<int> nt(hd.ncomp);
-      bool ok = true;
-      for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
-        if (!(f_his >> nt[icomp])) {
-          ok = false;
-          break;
-        }
+    vector<int> nt(hd.ncomp);
+    double et;
+    int lineno = 1;
+    while (getline(f_his, line)) {
+      ++lineno;
+      if (line.find_first_not_of(" \t\r") == string::npos)
+        continue; // blank line
+      if (!parse_entry(line, hd.ncomp, nt, et)) {
+        cerr << "Malformed entry on line " << lineno << " of " << hname
+             << ":\n  \"" << line << "\"\nExpected " << hd.ncomp
+             << " integer particle number(s) followed by the energy\n";
+        return 1;
       }
-      double et;
-      if (!ok || !(f_his >> et))
-        break;
+      if (f_his.eof()) {
+        // getline hit end of file without a newline: GOMC terminates every
+        // line, so the file may have been cut off mid-write
+        cerr << "Warning: last line of " << hname
+             << " has no newline; the file may be truncated\n";
+      }
 
       e_temp.push_back(et);
       for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
@@ -543,6 +602,10 @@ int main() {
       eng_max = max(eng_max, et);
     }
 
+    if (e_temp.empty()) {
+      cerr << "Histogram file " << hname << " contains no entries\n";
+      return 1;
+    }
     hd.nentry[ifile] = e_temp.size();
     for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
       hd.n[icomp][ifile] = n_temp[icomp];

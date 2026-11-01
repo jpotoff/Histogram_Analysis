@@ -1,14 +1,15 @@
 // c++ version of patching program
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <ios>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,8 +18,6 @@
 #include <omp.h>
 #endif
 using std::cerr;
-using std::clock;
-using std::clock_t;
 using std::cout;
 using std::endl;
 using std::ifstream;
@@ -75,6 +74,35 @@ bool gauss_solve(std::vector<std::vector<double>> &A, std::vector<double> &b,
   return true;
 }
 
+// Parses one data line of a histogram file: ncomp integer particle numbers
+// followed by the energy.  The whole line must be consumed, so a truncated,
+// non-numeric or non-integer field is reported instead of silently ending
+// the read.  Returns false on a malformed line.
+bool parse_entry(const string &line, int ncomp, vector<int> &nvals,
+                 double &energy) {
+  std::istringstream ss(line);
+  string tok;
+  size_t pos;
+  try {
+    for (int c = 0; c < ncomp; ++c) {
+      if (!(ss >> tok))
+        return false;
+      long v = std::stol(tok, &pos);
+      if (pos != tok.size())
+        return false;
+      nvals[c] = (int)v;
+    }
+    if (!(ss >> tok))
+      return false;
+    energy = std::stod(tok, &pos);
+    if (pos != tok.size())
+      return false;
+  } catch (const std::exception &) {
+    return false;
+  }
+  return !(ss >> tok); // nothing may follow the energy
+}
+
 int main(int argc, char *argv[]) {
   // Parse command line arguments for OpenMP threads
   for (int i = 1; i < argc; ++i) {
@@ -92,7 +120,7 @@ int main(int argc, char *argv[]) {
   }
 
   // read histogram labels
-  clock_t start_time = std::clock();
+  auto start_time = std::chrono::steady_clock::now();
   string suffix = "a";
   int ncompin;
   int nhist;
@@ -109,11 +137,21 @@ int main(int argc, char *argv[]) {
   fin >> ncompin;
   fin >> suffix;
   fin >> nhist;
+  if (!fin || ncompin < 1 || nhist < 1) {
+    cerr << "Error: input_hs.dat must start with the number of components, "
+            "the file suffix and the number of histograms"
+         << endl;
+    exit(1);
+  }
 
   int temp;
 
   for (int i = 0; i < nhist; ++i) {
-    fin >> temp;
+    if (!(fin >> temp)) {
+      cerr << "Error: input_hs.dat specifies " << nhist
+           << " histograms but lists only " << i << " histogram IDs" << endl;
+      exit(1);
+    }
     histid.push_back(temp);
   }
 
@@ -144,6 +182,7 @@ int main(int argc, char *argv[]) {
   double mu2;
   double *weight = new double[nhist];
   double *oldweight = new double[nhist];
+  vector<bool> have_weight(nhist, false); // starting weight from weights.dat
   double *lx = new double[nhist];
   double *ly = new double[nhist];
   double *lz = new double[nhist];
@@ -230,6 +269,12 @@ int main(int argc, char *argv[]) {
              << endl;
         exit(1);
       }
+      if (!(oldweight[i] > 0.0) || !std::isfinite(oldweight[i])) {
+        cerr << "Error: invalid weight " << oldweight[i] << " for entry "
+             << i + 1 << " of weights.dat" << endl;
+        exit(1);
+      }
+      have_weight[i] = true;
       if (id_old != histid[i]) {
         cerr << "Error: histogram order in input_hs.dat does not match "
                 "weights.dat"
@@ -255,17 +300,9 @@ int main(int argc, char *argv[]) {
     }
     fin2.clear();
     fin2.close();
-    if (nhist > nhist_old) {
-      for (int i = nhist_old; i < nhist; ++i) {
-        oldweight[i] = 100000000.0;
-      }
-    }
 
   } else if (!fin2) {
     oldrun = false;
-    for (int i = 0; i < nhist; ++i) {
-      oldweight[i] = 100000000.0;
-    }
   }
   cout << setfill('=') << setw(60) << "=" << setfill(' ') << endl;
 
@@ -298,12 +335,23 @@ int main(int argc, char *argv[]) {
       cerr << "Error: Could not open histogram file " << filein << endl;
       exit(1);
     }
-    // read header information
-    fin >> t[i] >> ncomp[i];
-    for (int c = 0; c < ncompin; ++c) {
-      fin >> mu[i][c];
+    // read header information: T, number of components, chemical
+    // potentials and box dimensions, all on the first line
+    string line;
+    std::getline(fin, line);
+    std::istringstream header(line);
+    header >> t[i] >> ncomp[i];
+    if (header && ncomp[i] == ncompin) {
+      for (int c = 0; c < ncompin; ++c) {
+        header >> mu[i][c];
+      }
+      header >> lx[i] >> ly[i] >> lz[i];
     }
-    fin >> lx[i] >> ly[i] >> lz[i];
+    if (!header) {
+      cerr << "Error: could not read the header (line 1) of " << filein
+           << endl;
+      exit(1);
+    }
 
     beta[i] = 1.0 / t[i]; // Computing the reciprocal value for the temp
 
@@ -329,14 +377,26 @@ int main(int argc, char *argv[]) {
         exit(1);
       }
     }
-    int j = 0;
     vector<int> ntemp(ncompin);
-    while (true) {
-      for (int c = 0; c < ncompin; ++c) {
-        fin >> ntemp[c];
+    int lineno = 1;
+    while (std::getline(fin, line)) {
+      ++lineno;
+      if (line.find_first_not_of(" \t\r") == string::npos)
+        continue; // blank line
+      if (!parse_entry(line, ncompin, ntemp, etemp)) {
+        cerr << "Error: malformed entry on line " << lineno << " of "
+             << filein << ":" << endl;
+        cerr << "  \"" << line << "\"" << endl;
+        cerr << "Expected " << ncompin
+             << " integer particle number(s) followed by the energy" << endl;
+        exit(1);
       }
-      fin >> etemp;
-      if (fin.eof() || fin.fail()) break;
+      if (fin.eof()) {
+        // getline hit end of file without a newline: GOMC terminates every
+        // line, so the file may have been cut off mid-write
+        cerr << "Warning: last line of " << filein
+             << " has no newline; the file may be truncated" << endl;
+      }
 
       for (int c = 0; c < ncompin; ++c) {
         minp[i][c] = std::min(minp[i][c], ntemp[c]);
@@ -345,7 +405,11 @@ int main(int argc, char *argv[]) {
         nt_temp[c].push_back(ntemp[c]);
       }
       et.push_back(etemp);
-      ++j;
+    }
+    if (et.empty()) {
+      cerr << "Error: histogram file " << filein << " contains no entries"
+           << endl;
+      exit(1);
     }
     // move data from temporary variables into vectors.  First index is
     // component,
@@ -406,7 +470,7 @@ int main(int argc, char *argv[]) {
   vector<double> log_w(nhist, 0.0);
 
   for (int jfile = 0; jfile < nhist; ++jfile) {
-    if (oldweight[jfile] == 100000000.0) {
+    if (!have_weight[jfile]) {
       double avg_A = 0.0;
       for (int i = 0; i < nentry[jfile]; ++i) {
         avg_A += A[(d_start + i) * nhist + jfile];
@@ -414,7 +478,7 @@ int main(int argc, char *argv[]) {
       if (nentry[jfile] > 0)
         avg_A /= nentry[jfile];
       log_w[jfile] = avg_A;
-          }
+    }
     d_start += nentry[jfile];
   }
 
@@ -423,7 +487,7 @@ int main(int argc, char *argv[]) {
   // ln(weight) spans thousands and exp() would overflow or underflow.
   double max_log = -1e300;
   for (int jfile = 0; jfile < nhist; ++jfile) {
-    if (oldweight[jfile] == 100000000.0 && log_w[jfile] > max_log) {
+    if (!have_weight[jfile] && log_w[jfile] > max_log) {
       max_log = log_w[jfile];
     }
   }
@@ -439,8 +503,7 @@ int main(int argc, char *argv[]) {
   // g_0 = 0 fixes the arbitrary normalization.
   vector<double> g(nhist), log_N(nhist);
   for (int j = 0; j < nhist; ++j) {
-    g[j] = (oldweight[j] == 100000000.0) ? log_w[j] - max_log
-                                          : log(oldweight[j]);
+    g[j] = have_weight[j] ? log(oldweight[j]) : log_w[j] - max_log;
     log_N[j] = log((double)nentry[j]);
   }
   for (int j = nhist - 1; j >= 0; --j)
@@ -589,7 +652,10 @@ int main(int argc, char *argv[]) {
       }
       fout << "Total iterations = " << iter << endl;
       fout << "Convergence = " << setprecision(10) << maxd << endl;
-      fout << "Run time " << ((clock() - start_time) / (double)CLOCKS_PER_SEC)
+      fout << "Run time "
+           << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                            start_time)
+                  .count()
            << " (s)" << endl;
       fout.close();
     }
