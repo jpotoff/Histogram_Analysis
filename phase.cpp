@@ -21,6 +21,10 @@ const double tolerance = 5e-3;
 const int maxiter = 500;
 const double pconverg = 1e-3;
 const double ctbar = 138.0;
+// Minimum number of empty-box (N = 0) samples needed to compute the
+// partition-function offset lnZ0; the statistical error in lnZ0 is roughly
+// 1/sqrt(n0), and larger when the samples are correlated
+const long min_n0 = 100;
 
 // Global Data equivalent to Fortran's MODULE hdata
 struct HData {
@@ -657,6 +661,42 @@ int main() {
   f_out24 << "total iterations = " << iter << "\n";
   f_out24.close();
 
+  // Partition-function offset for the pressure, beta P V = ln Z - lnZ0.  The
+  // N = 0 term of the grand partition function is exactly 1, so the empty-box
+  // part of the reweighted Z equals the unknown normalization constant.  Each
+  // N = 0 sample (E = 0) contributes 1 / sum_j (N_j / w_j) to Z independent
+  // of T and mu, giving lnZ0 = ln(n0 / sum_j (N_j / w_j)).  Without enough
+  // empty-box samples (e.g. only a run bridging gas and liquid) the pressure
+  // is not computed.
+  long n0 = 0;
+  for (int ifile = 0; ifile < hd.nfiles; ++ifile)
+    for (int i = 0; i < hd.nentry[ifile]; ++i) {
+      bool empty = true;
+      for (int icomp = 0; icomp < hd.ncomp; ++icomp)
+        if (hd.n[icomp][ifile][i] != 0)
+          empty = false;
+      if (empty) {
+        ++n0;
+        if (fabs(hd.e[ifile][i]) > 1e-6)
+          cerr << "Warning: N = 0 entry in " << hd.filename[ifile]
+               << " has nonzero energy " << hd.e[ifile][i] << endl;
+      }
+    }
+  bool have_lnZ0 = n0 >= min_n0;
+  double lnZ0_calc = 0.0;
+  if (have_lnZ0) {
+    double sum = 0.0;
+    for (int j = 0; j < hd.nfiles; ++j)
+      sum += hd.nentry[j] / hd.weight[j];
+    lnZ0_calc = log((double)n0) - log(sum);
+    cout << "lnZ0 from " << n0 << " empty-box samples = " << fixed
+         << setprecision(6) << lnZ0_calc << " (+/- ~" << setprecision(3)
+         << 1.0 / sqrt((double)n0) << ")" << endl;
+  } else {
+    cout << "Only " << n0 << " empty-box (N = 0) samples (need " << min_n0
+         << "): pressure not computed" << endl;
+  }
+
   vector<double> t_new, mu2min, mu2max, mu2_incr;
   double lnZ0 = 0.0, pset = 0.0;
   int ntemp = 0;
@@ -676,7 +716,8 @@ int main() {
     for (int icomp = 0; icomp < hd.ncomp; ++icomp)
       f_phase << setw(14) << "N_gas" + to_string(icomp + 1);
     f_phase << setw(14) << "Rho_liq" << setw(14) << "Rho_gas";
-    f_phase << setw(14) << "ln(Zliq)" << setw(14) << "ln(Zgas)\n";
+    f_phase << setw(14) << "ln(Zliq)" << setw(14) << "ln(Zgas)" << setw(14)
+            << "P(bar)\n";
     f_phase.close();
 
     ofstream f_trho_liq("trho_liq.dat");
@@ -753,7 +794,7 @@ int main() {
       f_ph.close();
 
       cout << "Read " << ntemp << " conditions from phinput.idat:" << endl;
-      cout << "  lnZ0=" << lnZ0 << endl;
+      cout << "  lnZ0 (phinput.idat, not used)=" << lnZ0 << endl;
       if (hd.ncomp > 0) {
         cout << "  Parsed Molecular Weights: ";
         for (int i = 0; i < hd.ncomp; ++i)
@@ -786,6 +827,16 @@ int main() {
     }
     ntemp = t_new.size();
     f_pvtin.close();
+  }
+
+  if (have_lnZ0) {
+    if (lphase && lnZ0 != 0.0)
+      cout << "lnZ0 computed = " << lnZ0_calc << ", phinput.idat = " << lnZ0
+           << ", difference = " << lnZ0_calc - lnZ0 << endl;
+    lnZ0 = lnZ0_calc;
+  } else if (lfixp) {
+    cout << "FIXED PRESSURE MODE REQUIRES EMPTY-BOX (N = 0) SAMPLES\n";
+    return 1;
   }
 
   for (hd.tnum = 0; hd.tnum < ntemp; ++hd.tnum) {
@@ -846,7 +897,9 @@ int main() {
             iter++;
           }
 
-          press = (log(hd.Zliq) - lnZ0) * ctbar / hd.betap / vol;
+          press = have_lnZ0
+                      ? (log(hd.Zliq) - lnZ0) * ctbar / hd.betap / vol
+                      : numeric_limits<double>::quiet_NaN();
 
           if (!lfixp) {
             diff2 = 1e-6;
@@ -903,7 +956,8 @@ int main() {
         for (int icomp = 0; icomp < hd.ncomp; ++icomp)
           f_phase << setw(14) << hd.ngas[icomp];
         f_phase << setw(14) << rho_liq << setw(14) << rho_gas;
-        f_phase << setw(14) << log(hd.Zliq) << setw(14) << log(hd.Zgas) << "\n";
+        f_phase << setw(14) << log(hd.Zliq) << setw(14) << log(hd.Zgas)
+                << setw(14) << press << "\n";
         f_phase.close();
 
         double larger_rho = std::max(rho_liq, rho_gas);
