@@ -166,6 +166,93 @@ void Zcalc(double &nbelow) {
   nbelow /= hd.Z;
 }
 
+// Finds mup[0] such that the gas and liquid regions carry equal probability
+// (nbelow = 0.5), starting from the current mup[0].  f(mu1) = ln(Zgas/Zliq)
+// decreases monotonically with mu1 and is +/-inf when one region has no
+// weight.  The root is first bracketed by steps of growing size (initial
+// size h, enlarged using the secant estimate when f is finite), then refined
+// by the Illinois variant of regula falsi, which bisects while an endpoint
+// is infinite.  Returns true on convergence, with hd and nbelow evaluated at
+// the returned mup[0]; nevals is the number of Zcalc calls.
+bool solve_mu1(double h, double &nbelow, int &nevals) {
+  const double ftol = 1e-6; // convergence: |nbelow - 0.5| <= ftol
+  nevals = 0;
+  bool bad = false;
+  auto F = [&](double x) {
+    hd.mup[0] = x;
+    Zcalc(nbelow);
+    ++nevals;
+    if (!isfinite(hd.Z) || !(hd.Z > 0.0) || isnan(nbelow)) {
+      bad = true;
+      return 0.0;
+    }
+    return log(hd.Zgas) - log(hd.Zliq);
+  };
+  auto done = [&]() { return fabs(0.5 - nbelow) <= ftol; };
+
+  h = fabs(h);
+  if (!(h > 0.0))
+    h = 1e-3;
+
+  // Bracket the root: a and b end up on opposite sides
+  double a = hd.mup[0], fa = F(a);
+  if (bad)
+    return false;
+  if (done())
+    return true;
+  double step = h, b, fb;
+  while (true) {
+    b = a + (fa > 0 ? step : -step); // f > 0: too much gas, raise mu1
+    fb = F(b);
+    if (bad)
+      return false;
+    if (done())
+      return true;
+    if ((fa > 0) != (fb > 0))
+      break;
+    if (nevals >= maxiter)
+      return false;
+    // displacement from b to the secant root, if it points the same way
+    double d = (isfinite(fa) && isfinite(fb) && fa != fb)
+                   ? fb * (b - a) / (fa - fb)
+                   : 0.0;
+    if (d != 0.0 && (d > 0) == (fb > 0))
+      step = min(max(1.2 * fabs(d), h), 4.0 * step);
+    else
+      step *= 2.0;
+    a = b;
+    fa = fb;
+  }
+
+  // Illinois regula falsi on the bracket [a, b]
+  int side = 0;
+  while (nevals < maxiter) {
+    double c = (isfinite(fa) && isfinite(fb)) ? (a * fb - b * fa) / (fb - fa)
+                                               : 0.5 * (a + b);
+    double fc = F(c);
+    if (bad)
+      return false;
+    if (done())
+      return true;
+    if ((fc > 0) == (fb > 0)) {
+      b = c;
+      fb = fc;
+      if (side == -1)
+        fa /= 2.0;
+      side = -1;
+    } else {
+      a = c;
+      fa = fc;
+      if (side == +1)
+        fb /= 2.0;
+      side = +1;
+    }
+    if (fabs(b - a) <= 1e-12 * max(1.0, fabs(a)))
+      return false; // bracket collapsed without reaching the tolerance
+  }
+  return false;
+}
+
 // Gaussian elimination for Ax = b
 // Solves in-place, modifying A and b. Returns false if singular.
 bool gauss_solve(vector<vector<double>> &A, vector<double> &b,
@@ -436,7 +523,7 @@ int main() {
   bool lpvt = false;
   bool lfixp = false;
 
-  cout << "PHASE VERSION 8.0" << endl;
+  cout << "PHASE VERSION 9.0" << endl;
   if (lphase && lpvt) {
     cout << "Can not do phase coexistence and PVT at the same time\nProgram "
             "terminating\n";
@@ -467,6 +554,11 @@ int main() {
   if (!f_input || hd.ncomp < 1 || hd.nfiles < 1) {
     cerr << "input_fsp2.dat must start with the number of components, the "
             "number of histograms and the file suffix\n";
+    return 1;
+  }
+  if (hd.ncomp > 2) {
+    cerr << "input_fsp2.dat specifies " << hd.ncomp
+         << " components; more than 2 components is not supported yet\n";
     return 1;
   }
 
@@ -513,10 +605,21 @@ int main() {
   double eng_min = 1e5;
   double eng_max = -1e5;
 
-  cout << "histogram     npoints  tstar  chemical potentials  min max n1 n2 "
-          "etc\n";
-  cout << "===================================================================="
-          "========\n";
+  // Histogram table: one mu column and one N min/max pair per component
+  size_t wname = 9;
+  for (int ifile = 0; ifile < hd.nfiles; ++ifile)
+    wname = max(wname, ("his" + hd.filename[ifile] + suffix + ".dat").size());
+  {
+    ostringstream h1;
+    h1 << left << setw(wname) << "Histogram" << right << setw(10) << "Entries"
+       << setw(10) << "T (K)";
+    for (int icomp = 0; icomp < hd.ncomp; ++icomp)
+      h1 << setw(12) << "mu" + to_string(icomp + 1) + " (K)";
+    for (int icomp = 0; icomp < hd.ncomp; ++icomp)
+      h1 << setw(9) << "N" + to_string(icomp + 1) + " min" << setw(9)
+         << "N" + to_string(icomp + 1) + " max";
+    cout << "\n" << h1.str() << "\n" << string(h1.str().size(), '-') << "\n";
+  }
 
   double xdim = 0, ydim = 0, zdim = 0;
   for (int ifile = 0; ifile < hd.nfiles; ++ifile) {
@@ -616,14 +719,17 @@ int main() {
     }
     hd.e[ifile] = e_temp;
 
-    cout << hname << " " << hd.nentry[ifile] << " " << fixed << setprecision(2)
-         << 1.0 / hd.beta[ifile] << " ";
+    cout << left << setw(wname) << hname << right << setw(10)
+         << hd.nentry[ifile] << fixed << setprecision(2) << setw(10)
+         << 1.0 / hd.beta[ifile];
     for (int icomp = 0; icomp < hd.ncomp; ++icomp)
-      cout << hd.mu[icomp][ifile] << " ";
+      cout << setw(12) << hd.mu[icomp][ifile];
     for (int icomp = 0; icomp < hd.ncomp; ++icomp)
-      cout << hd.m_partf[0][icomp] << " " << hd.m_partf[1][icomp] << " ";
+      cout << setw(9) << hd.m_partf[0][icomp] << setw(9)
+           << hd.m_partf[1][icomp];
     cout << endl;
   }
+  cout << endl;
 
   dmup[0] = hd.mu[0][0] / 10000.0;
   double vol = xdim * ydim * zdim;
@@ -730,20 +836,10 @@ int main() {
 
     ifstream f_ph("phinput.idat");
     if (!f_ph.is_open()) {
-      cout << "Warning: Could not open phinput.idat\n";
+      cout << "Warning: could not open phinput.idat; no coexistence points "
+              "computed\n";
     } else {
-      cout << "Successfully opened phinput.idat. Here are its contents:\n";
-      cout << "--------------------------------------------------\n";
       string line;
-      while (getline(f_ph, line)) {
-        cout << line << endl;
-      }
-      cout << "--------------------------------------------------\n";
-
-      // Re-open or clear the stream to parse properly
-      f_ph.clear();
-      f_ph.seekg(0);
-
       // Line 1: Header
       getline(f_ph, line);
 
@@ -763,13 +859,21 @@ int main() {
       // Lines 3+: Read MW if present, and any valid 6-parameter conditions
       hd.mw.assign(hd.ncomp, 1.0); // default MW if not provided
       bool next_line_is_mw = false;
+      bool found_mw = false;
+      int lineno = 2;
 
       while (getline(f_ph, line)) {
+        ++lineno;
         if (next_line_is_mw) {
           stringstream ss_mw(line);
           for (int i = 0; i < hd.ncomp; ++i) {
-            ss_mw >> hd.mw[i];
+            if (!(ss_mw >> hd.mw[i])) {
+              cerr << "Error: phinput.idat line " << lineno << " must give "
+                   << hd.ncomp << " molecular weight(s)\n";
+              return 1;
+            }
           }
+          found_mw = true;
           next_line_is_mw = false;
           continue;
         }
@@ -778,6 +882,8 @@ int main() {
           next_line_is_mw = true;
           continue;
         }
+        if (line.find_first_not_of(" \t\r") == string::npos)
+          continue; // blank line
 
         stringstream ss(line);
         double t, m2min, m2max, m2inc, nmid_val, slope_val;
@@ -788,24 +894,20 @@ int main() {
           mu2_incr.push_back(m2inc);
           hd.nmid.push_back(nmid_val);
           hd.slope.push_back(slope_val);
+        } else {
+          cerr << "Warning: phinput.idat line " << lineno
+               << " ignored (expected T mu2min mu2max mu2inc nmid slope):\n  \""
+               << line << "\"\n";
         }
       }
       ntemp = t_new.size();
       f_ph.close();
 
-      cout << "Read " << ntemp << " conditions from phinput.idat:" << endl;
-      cout << "  lnZ0 (phinput.idat, not used)=" << lnZ0 << endl;
-      if (hd.ncomp > 0) {
-        cout << "  Parsed Molecular Weights: ";
-        for (int i = 0; i < hd.ncomp; ++i)
-          cout << hd.mw[i] << " ";
-        cout << endl;
-      }
-      for (int i = 0; i < ntemp; ++i) {
-        cout << "  T=" << t_new[i] << " m2min=" << mu2min[i]
-             << " m2max=" << mu2max[i] << " m2inc=" << mu2_incr[i]
-             << " nmid=" << hd.nmid[i] << " slope=" << hd.slope[i] << endl;
-      }
+      if (!found_mw)
+        cerr << "Warning: no MW line in phinput.idat; molecular weights set "
+                "to 1, so densities in kg/m^3 are not meaningful\n";
+      if (ntemp == 0)
+        cerr << "Warning: no conditions found in phinput.idat\n";
     }
 
   } else if (lpvt) {
@@ -845,25 +947,30 @@ int main() {
     iter = 0;
 
     if (lphase) {
-      if (mu2_incr[hd.tnum] > 0 && hd.ncomp > 2)
-        hd.mup[hd.ncomp - 1] = mu2min[hd.tnum];
-      else if (mu2_incr[hd.tnum] < 0 && hd.ncomp > 2)
-        hd.mup[hd.ncomp - 1] = mu2max[hd.tnum];
-      else if (hd.ncomp == 2)
-        hd.mup[hd.ncomp - 1] = mu2min[hd.tnum];
+      // One component: a single coexistence point.  Two components: scan mu2
+      // from mu2min to mu2max (or mu2max down to mu2min for a negative
+      // increment); a zero increment gives the single point mu2min.
+      int npts = 1;
+      double mu2start = mu2min[hd.tnum];
+      double inc = mu2_incr[hd.tnum];
+      if (hd.ncomp == 2) {
+        if (mu2max[hd.tnum] < mu2min[hd.tnum]) {
+          cerr << "phinput.idat: mu2max < mu2min at T = " << t_new[hd.tnum]
+               << endl;
+          return 1;
+        }
+        if (inc != 0.0)
+          npts = (int)floor((mu2max[hd.tnum] - mu2min[hd.tnum]) / fabs(inc) +
+                            1e-6) +
+                 1;
+        if (inc < 0.0)
+          mu2start = mu2max[hd.tnum];
+      }
 
-      bool keep_going = true;
-      while (keep_going) {
-        if (hd.ncomp == 1 && iter == 0)
-          keep_going = true;
-        else if (hd.mup[hd.ncomp - 1] < mu2max[hd.tnum] + 0.00001 &&
-                 hd.mup[hd.ncomp - 1] > mu2min[hd.tnum] - 0.00001)
-          keep_going = true;
-        else
-          keep_going = false;
-
-        if (!keep_going)
-          break;
+      for (int ipt = 0; ipt < npts; ++ipt) {
+        if (hd.ncomp == 2)
+          hd.mup[1] = mu2start + ipt * inc;
+        double mu1_start = hd.mup[0]; // restored if this point fails
 
         if (lfixp) {
           if (hd.ncomp < 2) {
@@ -880,21 +987,12 @@ int main() {
         num++;
         double press = 0.0;
         double nbelow = 0.0;
-        double nbelow1 = 0.0;
+        bool solved = true;
 
         while (diff2 > pconverg && iter2 < maxiter) {
-          iter = 0;
-
-          while (abs(0.5 - nbelow) > 1e-6 && iter <= maxiter) {
-            if (iter > 0) {
-              hd.mup[0] += dmup[0];
-              Zcalc(nbelow1);
-              hd.mup[0] -= (log(nbelow1) - log(1.0 - nbelow1)) * dmup[0] /
-                           (log(nbelow1) - log(nbelow) - log(1.0 - nbelow1) +
-                            log(1.0 - nbelow));
-            }
-            Zcalc(nbelow);
-            iter++;
+          if (!solve_mu1(dmup[0], nbelow, iter)) {
+            solved = false;
+            break;
           }
 
           press = have_lnZ0
@@ -927,6 +1025,17 @@ int main() {
             }
           }
           iter2++;
+        }
+
+        if (!solved) {
+          cerr << "Warning: no coexistence found at T = " << 1.0 / hd.betap;
+          if (hd.ncomp == 2)
+            cerr << ", mu2 = " << hd.mup[1];
+          cerr << " after " << iter << " evaluations (nbelow = " << nbelow
+               << ", mu1 = " << hd.mup[0]
+               << "); point skipped, mu1 guess restored" << endl;
+          hd.mup[0] = mu1_start;
+          continue;
         }
 
         for (int icomp = 0; icomp < hd.ncomp; ++icomp) {
@@ -993,11 +1102,7 @@ int main() {
           }
           f_d.close();
         }
-
-        if (hd.ncomp >= 2) {
-          hd.mup[1] += mu2_incr[hd.tnum];
-        }
-      } // while (keep_going)
+      } // for (ipt)
 
     } else if (lpvt) {
       num = 1;
